@@ -89,6 +89,12 @@ export class SalesController {
     return this.salesService.deliverGoods(id);
   }
 
+  @Post('orders/:id/create-invoice')
+  @ApiOperation({ summary: 'Create Customer Invoice (Bill) for Sales Order' })
+  createInvoice(@Param('id') id: string, @Body() dto: any) {
+    return this.salesService.createInvoiceForSalesOrder(id, dto);
+  }
+
   @Post('orders/:id/cancel')
   @ApiOperation({ summary: 'Cancel Sales Order' })
   cancelOrder(@Param('id') id: string) {

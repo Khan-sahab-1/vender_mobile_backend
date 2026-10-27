@@ -10,6 +10,7 @@ import { AccountType } from '../account-accounts/enums/account-account.enum';
 import { AccountJournal } from '../account-journals/entities/account-journal.entity';
 import { AccountJournalType } from '../account-journals/enums/account-journal.enum';
 import { AccountMovesService } from '../account-moves/account-moves.service';
+import { AccountMove } from '../account-moves/entities/account-move.entity';
 import {
   AccountMoveState,
   AccountMoveType,
@@ -36,18 +37,27 @@ export class CustomerInvoicesService {
   async generateInvoiceNumber(): Promise<string> {
     const year = new Date().getFullYear();
     const result = await this.invoiceRepo.manager.query(
-      `SELECT invoice_number FROM customer_invoices WHERE invoice_number LIKE 'INV/${year}/%' ORDER BY invoice_number DESC LIMIT 1`,
+      `SELECT COALESCE(MAX(seq), 0) as max_seq FROM (
+        SELECT CAST(SUBSTRING(invoice_number FROM 'INV/\\d{4}/(\\d+)') AS INTEGER) AS seq 
+        FROM customer_invoices 
+        WHERE invoice_number LIKE 'INV/${year}/%'
+        UNION
+        SELECT CAST(SUBSTRING(name FROM 'INV/\\d{4}/(\\d+)') AS INTEGER) AS seq 
+        FROM account_moves 
+        WHERE name LIKE 'INV/${year}/%'
+      ) t`,
     );
-    let nextSeq = 1;
-    if (result && result.length > 0 && result[0]?.invoice_number) {
-      const parts = String(result[0].invoice_number).split('/');
-      const lastSeq = parseInt(parts[parts.length - 1], 10);
-      if (!isNaN(lastSeq)) {
-        nextSeq = lastSeq + 1;
-      }
+    const maxSeq = result && result[0] ? Number(result[0].max_seq) : 0;
+    let nextSeq = maxSeq + 1;
+    let candidate = `INV/${year}/${String(nextSeq).padStart(5, '0')}`;
+    while (
+      (await this.invoiceRepo.findOne({ where: { invoiceNumber: candidate } })) ||
+      (await this.invoiceRepo.manager.getRepository(AccountMove).findOne({ where: { name: candidate } }))
+    ) {
+      nextSeq++;
+      candidate = `INV/${year}/${String(nextSeq).padStart(5, '0')}`;
     }
-    const seq = String(nextSeq).padStart(5, '0');
-    return `INV/${year}/${seq}`;
+    return candidate;
   }
 
   formatCustomerAddress(customer: any): string {
@@ -68,7 +78,15 @@ export class CustomerInvoicesService {
    * Mirrors Odoo: At draft state, invoice & lines exist.
    * No journal entry (account.move) is created yet until validated.
    */
-  async createFromSalesOrder(so: any): Promise<CustomerInvoice> {
+  async createFromSalesOrder(
+    so: any,
+    lineOverrides?: Array<{
+      productId?: string;
+      lineId?: string;
+      quantity: number;
+      unitPrice?: number;
+    }>,
+  ): Promise<CustomerInvoice> {
     const customerAddress = this.formatCustomerAddress(so.customer);
 
     // Find default Sale journal (INV)
@@ -90,10 +108,84 @@ export class CustomerInvoicesService {
       )) as any;
     }
 
-    const amountUntaxed = Number(so.amountUntaxed || 0);
-    const amountDiscount = Number(so.amountDiscount || 0);
-    const amountTax = Number(so.amountTax || 0);
-    const amountTotal = Number(so.amountTotal || 0);
+    let amountUntaxed = 0;
+    let amountDiscount = 0;
+    let amountTax = 0;
+    let amountTotal = 0;
+
+    let invoiceLinesData: Array<{
+      productId: string;
+      description: string;
+      quantity: number;
+      unitPrice: number;
+      discount: number;
+      taxId?: string;
+      taxAmount: number;
+      subtotal: number;
+    }> = [];
+
+    if (Array.isArray(lineOverrides) && lineOverrides.length > 0) {
+      for (const override of lineOverrides) {
+        const soLine = (so.lines || []).find(
+          (l: any) =>
+            (override.lineId && l.id === override.lineId) ||
+            (override.productId && l.productId === override.productId),
+        );
+        const qty = Number(override.quantity || 1);
+        if (qty <= 0) continue;
+        const price =
+          override.unitPrice !== undefined
+            ? Number(override.unitPrice)
+            : Number(soLine?.unitPrice || 0);
+        const discountPercent = Number(soLine?.discount || 0);
+        const lineSubtotal = qty * price;
+        const lineDiscount = lineSubtotal * (discountPercent / 100);
+        const taxable = lineSubtotal - lineDiscount;
+        const taxRate = soLine?.tax
+          ? (Number(soLine.tax.amount) || 0) / 100
+          : 0;
+        const lineTaxAmount = taxable * taxRate;
+        const lineTotal = taxable + lineTaxAmount;
+
+        amountUntaxed += taxable;
+        amountDiscount += lineDiscount;
+        amountTax += lineTaxAmount;
+        amountTotal += lineTotal;
+
+        invoiceLinesData.push({
+          productId: override.productId || soLine?.productId,
+          description:
+            soLine?.description || soLine?.product?.name || 'Sales item',
+          quantity: qty,
+          unitPrice: price,
+          discount: discountPercent,
+          taxId: soLine?.taxId,
+          taxAmount: Math.round(lineTaxAmount * 100) / 100,
+          subtotal: Math.round(lineTotal * 100) / 100,
+        });
+      }
+    } else {
+      amountUntaxed = Number(so.amountUntaxed || 0);
+      amountDiscount = Number(so.amountDiscount || 0);
+      amountTax = Number(so.amountTax || 0);
+      amountTotal = Number(so.amountTotal || 0);
+
+      invoiceLinesData = (so.lines || []).map((l: any) => ({
+        productId: l.productId,
+        description: l.description || l.product?.name || 'Sales item',
+        quantity: Number(l.quantity || 1),
+        unitPrice: Number(l.unitPrice || 0),
+        discount: Number(l.discount || 0),
+        taxId: l.taxId,
+        taxAmount: Number(l.taxAmount || 0),
+        subtotal: Number(l.subtotal || 0),
+      }));
+    }
+
+    amountUntaxed = Math.round(amountUntaxed * 100) / 100;
+    amountDiscount = Math.round(amountDiscount * 100) / 100;
+    amountTax = Math.round(amountTax * 100) / 100;
+    amountTotal = Math.round(amountTotal * 100) / 100;
 
     const invoice = this.invoiceRepo.create({
       invoiceNumber: null as any, // Generated upon validation
@@ -121,19 +213,19 @@ export class CustomerInvoicesService {
 
     const savedInvoice = await this.invoiceRepo.save(invoice);
 
-    if (so.lines && so.lines.length > 0) {
-      const invLines = so.lines.map((l: any) =>
+    if (invoiceLinesData.length > 0) {
+      const invLines = invoiceLinesData.map((l) =>
         this.lineRepo.create({
           invoiceId: savedInvoice.id,
           invoice: { id: savedInvoice.id } as any,
           productId: l.productId,
-          description: l.description || l.product?.name || 'Sales item',
-          quantity: Number(l.quantity || 1),
-          unitPrice: Number(l.unitPrice || 0),
-          discount: Number(l.discount || 0),
+          description: l.description,
+          quantity: l.quantity,
+          unitPrice: l.unitPrice,
+          discount: l.discount,
           taxId: l.taxId,
-          taxAmount: Number(l.taxAmount || 0),
-          subtotal: Number(l.subtotal || 0),
+          taxAmount: l.taxAmount,
+          subtotal: l.subtotal,
         }),
       );
       await this.lineRepo.save(invLines);
@@ -163,7 +255,8 @@ export class CustomerInvoicesService {
     if (
       !invoice.invoiceNumber ||
       invoice.invoiceNumber === 'DRAFT' ||
-      invoice.invoiceNumber.startsWith('DRAFT')
+      invoice.invoiceNumber.startsWith('DRAFT') ||
+      (await this.invoiceRepo.manager.getRepository(AccountMove).findOne({ where: { name: invoice.invoiceNumber } }))
     ) {
       invoice.invoiceNumber = await this.generateInvoiceNumber();
     }
@@ -456,7 +549,7 @@ export class CustomerInvoicesService {
       throw new NotFoundException(`Customer Invoice #${id} not found`);
     }
 
-    return this.findOne(id);
+    return invoice;
   }
 
   async update(id: string, dto: any): Promise<CustomerInvoice> {
@@ -492,6 +585,7 @@ export class CustomerInvoicesService {
 
         const line = this.lineRepo.create({
           invoiceId: invoice.id,
+          invoice: { id: invoice.id } as any,
           productId: l.productId,
           description: l.description || 'Sales item',
           quantity: qty,
@@ -504,7 +598,8 @@ export class CustomerInvoicesService {
         newLines.push(line);
       }
 
-      await this.lineRepo.save(newLines);
+      const savedLines = await this.lineRepo.save(newLines);
+      invoice.lines = savedLines;
       invoice.amountUntaxed = Math.round(amountUntaxed * 100) / 100;
       invoice.amountTax = Math.round(amountTax * 100) / 100;
       invoice.amountTotal = Math.round((amountUntaxed + amountTax) * 100) / 100;

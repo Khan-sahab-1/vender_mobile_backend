@@ -10,6 +10,7 @@ import { AccountType } from "../account-accounts/enums/account-account.enum";
 import { AccountJournal } from "../account-journals/entities/account-journal.entity";
 import { AccountJournalType } from "../account-journals/enums/account-journal.enum";
 import { AccountMovesService } from "../account-moves/account-moves.service";
+import { AccountMove } from "../account-moves/entities/account-move.entity";
 import { AccountMoveLine } from "../account-moves/entities/account-move-line.entity";
 import {
   AccountMoveState,
@@ -51,18 +52,27 @@ export class VendorBillsService {
   async generateBillNumber(): Promise<string> {
     const year = new Date().getFullYear();
     const result = await this.repo.manager.query(
-      `SELECT bill_number FROM vendor_bills WHERE bill_number LIKE 'BILL/${year}/%' ORDER BY bill_number DESC LIMIT 1`
+      `SELECT COALESCE(MAX(seq), 0) as max_seq FROM (
+        SELECT CAST(SUBSTRING(bill_number FROM 'BILL/\\d{4}/(\\d+)') AS INTEGER) AS seq 
+        FROM vendor_bills 
+        WHERE bill_number LIKE 'BILL/${year}/%'
+        UNION
+        SELECT CAST(SUBSTRING(name FROM 'BILL/\\d{4}/(\\d+)') AS INTEGER) AS seq 
+        FROM account_moves 
+        WHERE name LIKE 'BILL/${year}/%'
+      ) t`
     );
-    let nextSeq = 1;
-    if (result && result.length > 0 && result[0]?.bill_number) {
-      const parts = String(result[0].bill_number).split("/");
-      const lastSeq = parseInt(parts[parts.length - 1], 10);
-      if (!isNaN(lastSeq)) {
-        nextSeq = lastSeq + 1;
-      }
+    const maxSeq = result && result[0] ? Number(result[0].max_seq) : 0;
+    let nextSeq = maxSeq + 1;
+    let candidate = `BILL/${year}/${String(nextSeq).padStart(5, "0")}`;
+    while (
+      (await this.repo.findOne({ where: { billNumber: candidate } })) ||
+      (await this.repo.manager.getRepository(AccountMove).findOne({ where: { name: candidate } }))
+    ) {
+      nextSeq++;
+      candidate = `BILL/${year}/${String(nextSeq).padStart(5, "0")}`;
     }
-    const seq = String(nextSeq).padStart(5, "0");
-    return `BILL/${year}/${seq}`;
+    return candidate;
   }
 
   formatVendorAddress(vendor: any): string {
@@ -185,7 +195,12 @@ export class VendorBillsService {
     }
 
     // Generate official Bill Sequence Number upon validation (Odoo style)
-    if (!bill.billNumber || bill.billNumber === "DRAFT" || bill.billNumber.startsWith("DRAFT")) {
+    if (
+      !bill.billNumber ||
+      bill.billNumber === "DRAFT" ||
+      bill.billNumber.startsWith("DRAFT") ||
+      (await this.repo.manager.getRepository(AccountMove).findOne({ where: { name: bill.billNumber } }))
+    ) {
       bill.billNumber = await this.generateBillNumber();
     }
 

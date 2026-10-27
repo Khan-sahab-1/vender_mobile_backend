@@ -59,7 +59,23 @@ export class AccountMovesService {
       );
     }
 
-    const moveName = preferredName || (await this.generateMoveNumber(journal.code));
+    let moveName = preferredName;
+    if (moveName) {
+      const exists = await this.moveRepo.findOne({ where: { name: moveName } });
+      if (exists) {
+        moveName = await this.generateMoveNumber(journal.code);
+      }
+    } else {
+      moveName = await this.generateMoveNumber(journal.code);
+    }
+
+    // Safety loop: ensure moveName is absolutely unique in account_moves
+    while (await this.moveRepo.findOne({ where: { name: moveName } })) {
+      const parts = moveName.split('/');
+      const last = parseInt(parts[parts.length - 1], 10);
+      const nextSeq = isNaN(last) ? String(Date.now()).slice(-5) : String(last + 1).padStart(5, '0');
+      moveName = `${parts.slice(0, -1).join('/')}/${nextSeq}`;
+    }
 
     const move = this.moveRepo.create({
       name: moveName,
@@ -184,11 +200,26 @@ export class AccountMovesService {
   async generateMoveNumber(journalCode: string): Promise<string> {
     const year = new Date().getFullYear();
     const prefix = `${journalCode}/${year}/`;
-    const count = await this.moveRepo
-      .createQueryBuilder("move")
-      .where("move.name LIKE :prefix", { prefix: `${prefix}%` })
-      .getCount();
-    const nextSeq = String(count + 1).padStart(5, "0");
-    return `${prefix}${nextSeq}`;
+    try {
+      const result = await this.moveRepo.manager.query(
+        `SELECT COALESCE(MAX(CAST(SUBSTRING(name FROM '${journalCode}/\\d{4}/(\\d+)') AS INTEGER)), 0) as max_seq 
+         FROM account_moves 
+         WHERE name LIKE '${prefix}%'`
+      );
+      const maxSeq = result && result[0] ? Number(result[0].max_seq) : 0;
+      let nextSeq = maxSeq + 1;
+      let candidate = `${prefix}${String(nextSeq).padStart(5, '0')}`;
+      while (await this.moveRepo.findOne({ where: { name: candidate } })) {
+        nextSeq++;
+        candidate = `${prefix}${String(nextSeq).padStart(5, '0')}`;
+      }
+      return candidate;
+    } catch {
+      const count = await this.moveRepo
+        .createQueryBuilder('move')
+        .where('move.name LIKE :prefix', { prefix: `${prefix}%` })
+        .getCount();
+      return `${prefix}${String(count + 1).padStart(5, '0')}`;
+    }
   }
 }

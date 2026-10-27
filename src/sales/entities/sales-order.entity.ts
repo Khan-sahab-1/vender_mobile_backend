@@ -149,6 +149,8 @@ export class SalesOrder extends BaseEntity {
   @Column({ name: 'customer_invoice_id', nullable: true })
   customerInvoiceId?: string;
 
+  customerInvoices?: CustomerInvoice[];
+
   @ManyToOne(() => StockPicking, { nullable: true, eager: true })
   @JoinColumn({ name: 'stock_picking_id' })
   stockPicking?: StockPicking;

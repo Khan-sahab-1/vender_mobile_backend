@@ -14,6 +14,7 @@ import { Warehouse } from '../warehouses/entities/warehouse.entity';
 import { Division } from '../divisions/entities/division.entity';
 import { Location, LocationUsage } from '../locations/entities/location.entity';
 import { CustomerInvoicesService } from '../customer-invoices/customer-invoices.service';
+import { CustomerInvoice } from '../customer-invoices/entities/customer-invoice.entity';
 import { CustomerInvoiceState } from '../customer-invoices/enums/customer-invoice.enum';
 import { StockPickingsService } from '../stock-pickings/stock-pickings.service';
 import { PickingType } from '../stock-pickings/enums/stock-picking.enum';
@@ -369,55 +370,83 @@ export class SalesService {
 
     const orders = await qb.getMany();
 
-    return orders.map((o) => ({
-      id: o.id,
-      name: o.name,
-      soNumber: o.name,
-      customer: o.customer?.name || 'Customer',
-      customerId: o.customerId,
-      customerRecord: o.customer,
-      deliveryAddress: o.deliveryAddress,
-      poRefNo: o.poRefNo,
-      clientRef: o.poRefNo,
-      clientPoDate: o.clientPoDate,
-      orderDate: o.orderDate,
-      date: o.orderDate,
-      deliveryDays: o.deliveryDays,
-      deliveryDate: o.deliveryDate,
-      customerInvoice: o.customerInvoice,
-      customerInvoiceId: o.customerInvoiceId,
-      stockPicking: o.stockPicking,
-      stockPickingId: o.stockPickingId,
-      type: o.type,
-      state: o.state,
-      currency: o.currency || 'INR',
-      untaxedAmount: Number(o.amountUntaxed || 0),
-      taxAmount: Number(o.amountTax || 0),
-      totalAmount: Number(o.amountTotal || 0),
-      discountAmount: Number(o.amountDiscount || 0),
-      warehouse: o.warehouse,
-      division: o.division,
-      pricelist: o.pricelist,
-      paymentTerm: o.paymentTerm,
-      transporter: o.transporter,
-      transporterName: o.transporterName,
-      note: o.note,
-      lines: o.lines?.map((l) => ({
-        id: l.id,
-        productId: l.productId,
-        product: l.product,
-        description: l.description,
-        productName: l.product?.name || l.description,
-        quantity: Number(l.quantity || 0),
-        unitPrice: Number(l.unitPrice || 0),
-        discount: Number(l.discount || 0),
-        discountAmount: Number(l.discountAmount || 0),
-        tax: l.tax,
-        taxAmount: Number(l.taxAmount || 0),
-        subtotal: Number(l.subtotal || 0),
-        total: Number(l.total || 0),
-      })),
-    }));
+    const orderIds = orders.map((o) => o.id);
+    const invoiceMap = new Map<string, any[]>();
+    if (orderIds.length > 0) {
+      const allInvoices = await this.orderRepo.manager
+        .getRepository(CustomerInvoice)
+        .find({
+          where: orderIds.map((id) => ({ salesOrderId: id })),
+          order: { createdAt: 'DESC' },
+        });
+      for (const inv of allInvoices) {
+        if (inv.salesOrderId) {
+          if (!invoiceMap.has(inv.salesOrderId)) {
+            invoiceMap.set(inv.salesOrderId, []);
+          }
+          invoiceMap.get(inv.salesOrderId)!.push(inv);
+        }
+      }
+    }
+
+    return orders.map((o) => {
+      const linkedInvoices =
+        invoiceMap.get(o.id) || (o.customerInvoice ? [o.customerInvoice] : []);
+      const invoiceCount = linkedInvoices.length;
+
+      return {
+        id: o.id,
+        name: o.name,
+        soNumber: o.name,
+        customer: o.customer?.name || 'Customer',
+        customerId: o.customerId,
+        customerRecord: o.customer,
+        deliveryAddress: o.deliveryAddress,
+        poRefNo: o.poRefNo,
+        clientRef: o.poRefNo,
+        clientPoDate: o.clientPoDate,
+        orderDate: o.orderDate,
+        date: o.orderDate,
+        deliveryDays: o.deliveryDays,
+        deliveryDate: o.deliveryDate,
+        customerInvoice: linkedInvoices[0] || o.customerInvoice || null,
+        customerInvoiceId:
+          linkedInvoices[0]?.id || o.customerInvoiceId || null,
+        customerInvoices: linkedInvoices,
+        customerInvoiceCount: invoiceCount,
+        stockPicking: o.stockPicking,
+        stockPickingId: o.stockPickingId,
+        type: o.type,
+        state: o.state,
+        currency: o.currency || 'INR',
+        untaxedAmount: Number(o.amountUntaxed || 0),
+        taxAmount: Number(o.amountTax || 0),
+        totalAmount: Number(o.amountTotal || 0),
+        discountAmount: Number(o.amountDiscount || 0),
+        warehouse: o.warehouse,
+        division: o.division,
+        pricelist: o.pricelist,
+        paymentTerm: o.paymentTerm,
+        transporter: o.transporter,
+        transporterName: o.transporterName,
+        note: o.note,
+        lines: o.lines?.map((l) => ({
+          id: l.id,
+          productId: l.productId,
+          product: l.product,
+          description: l.description,
+          productName: l.product?.name || l.description,
+          quantity: Number(l.quantity || 0),
+          unitPrice: Number(l.unitPrice || 0),
+          discount: Number(l.discount || 0),
+          discountAmount: Number(l.discountAmount || 0),
+          tax: l.tax,
+          taxAmount: Number(l.taxAmount || 0),
+          subtotal: Number(l.subtotal || 0),
+          total: Number(l.total || 0),
+        })),
+      };
+    });
   }
 
   async getSalesOrderDetail(id: string): Promise<any> {
@@ -443,6 +472,62 @@ export class SalesService {
       throw new NotFoundException(`Sales Order #${id} not found`);
     }
 
+    // Fetch all customer invoices linked to this SO
+    const allInvoices = await this.orderRepo.manager
+      .getRepository(CustomerInvoice)
+      .find({
+        where: { salesOrderId: id },
+        relations: ['lines', 'lines.product', 'lines.tax'],
+        order: { createdAt: 'DESC' },
+      });
+
+    // Calculate line-level invoiced quantities across all non-cancelled invoices
+    const linesWithInvoiced = (o.lines || []).map((l) => {
+      let invoicedQty = 0;
+      allInvoices.forEach((inv) => {
+        if (
+          inv.state === CustomerInvoiceState.CANCELLED ||
+          (inv.state as string) === 'cancel'
+        )
+          return;
+        (inv.lines || []).forEach((invLine) => {
+          if (invLine.productId === l.productId) {
+            invoicedQty += Number(invLine.quantity || 0);
+          }
+        });
+      });
+      const orderedQty = Number(l.quantity || 0);
+      const remainingQty = Math.max(0, orderedQty - invoicedQty);
+
+      return {
+        ...l,
+        productName: l.product?.name || l.description,
+        uom: l.product?.uom?.name || 'Units',
+        quantity: orderedQty,
+        orderedQuantity: orderedQty,
+        invoicedQuantity: invoicedQty,
+        remainingQuantity: remainingQty,
+        unitPrice: Number(l.unitPrice || 0),
+        subtotal: Number(l.subtotal || 0),
+        total: Number(l.total || 0),
+      };
+    });
+
+    const activeInvoices = allInvoices.filter(
+      (inv) =>
+        inv.state !== CustomerInvoiceState.CANCELLED &&
+        (inv.state as string) !== 'cancel',
+    );
+    const totalInvoicedAmount = activeInvoices.reduce(
+      (sum, inv) => sum + Number(inv.amountTotal || 0),
+      0,
+    );
+
+    const isFullyInvoiced =
+      activeInvoices.length > 0 &&
+      linesWithInvoiced.length > 0 &&
+      linesWithInvoiced.every((l) => l.remainingQuantity <= 0);
+
     return {
       ...o,
       soNumber: o.name,
@@ -450,24 +535,125 @@ export class SalesService {
       customer: o.customer?.name || 'Customer',
       clientRef: o.poRefNo,
       date: o.orderDate,
-      customerInvoice: o.customerInvoice,
-      customerInvoiceId: o.customerInvoiceId,
+      customerInvoices: allInvoices,
+      customerInvoiceCount: allInvoices.length,
+      customerInvoice: allInvoices[0] || o.customerInvoice || null,
+      customerInvoiceId: allInvoices[0]?.id || o.customerInvoiceId || null,
+      totalInvoicedAmount: Math.round(totalInvoicedAmount * 100) / 100,
+      remainingAmountToInvoice: Math.max(
+        0,
+        Math.round((Number(o.amountTotal || 0) - totalInvoicedAmount) * 100) /
+          100,
+      ),
+      isFullyInvoiced,
       stockPicking: o.stockPicking,
       stockPickingId: o.stockPickingId,
       untaxedAmount: Number(o.amountUntaxed || 0),
       taxAmount: Number(o.amountTax || 0),
       totalAmount: Number(o.amountTotal || 0),
       discountAmount: Number(o.amountDiscount || 0),
-      lines: o.lines?.map((l) => ({
-        ...l,
-        productName: l.product?.name || l.description,
-        uom: l.product?.uom?.name || 'Units',
-        quantity: Number(l.quantity || 0),
-        unitPrice: Number(l.unitPrice || 0),
-        subtotal: Number(l.subtotal || 0),
-        total: Number(l.total || 0),
-      })),
+      lines: linesWithInvoiced,
     };
+  }
+
+  async createInvoiceForSalesOrder(
+    id: string,
+    dto?: {
+      lines?: Array<{
+        productId?: string;
+        lineId?: string;
+        quantity: number;
+        unitPrice?: number;
+      }>;
+    },
+  ): Promise<any> {
+    const order = await this.orderRepo.findOne({
+      where: { id },
+      relations: [
+        'customer',
+        'warehouse',
+        'division',
+        'lines',
+        'lines.product',
+        'lines.tax',
+      ],
+    });
+    if (!order) throw new NotFoundException(`Sales Order ${id} not found`);
+
+    if (
+      order.state !== SalesOrderState.APPROVED &&
+      order.state !== SalesOrderState.SALE &&
+      order.state !== SalesOrderState.DRAFT
+    ) {
+      throw new BadRequestException(
+        `Cannot create invoice for order in "${order.state}" state`,
+      );
+    }
+
+    let linesToInvoice = dto?.lines;
+
+    // If no custom lines provided, invoice remaining un-invoiced quantities
+    if (!linesToInvoice || linesToInvoice.length === 0) {
+      const existingInvoices = await this.orderRepo.manager
+        .getRepository(CustomerInvoice)
+        .find({
+          where: { salesOrderId: id },
+          relations: ['lines'],
+        });
+
+      const remainingLines: Array<{
+        lineId: string;
+        productId: string;
+        quantity: number;
+      }> = [];
+
+      for (const line of order.lines || []) {
+        let invoicedQty = 0;
+        existingInvoices.forEach((inv) => {
+          if (
+            inv.state === CustomerInvoiceState.CANCELLED ||
+            (inv.state as string) === 'cancel'
+          )
+            return;
+          (inv.lines || []).forEach((invLine) => {
+            if (invLine.productId === line.productId) {
+              invoicedQty += Number(invLine.quantity || 0);
+            }
+          });
+        });
+        const rem = Math.max(0, Number(line.quantity || 0) - invoicedQty);
+        if (rem > 0) {
+          remainingLines.push({
+            lineId: line.id,
+            productId: line.productId,
+            quantity: rem,
+          });
+        }
+      }
+
+      if (remainingLines.length === 0) {
+        // If all items already invoiced, allow invoicing 100% full lines as an additional billing
+        linesToInvoice = (order.lines || []).map((l) => ({
+          lineId: l.id,
+          productId: l.productId,
+          quantity: Number(l.quantity || 1),
+        }));
+      } else {
+        linesToInvoice = remainingLines;
+      }
+    }
+
+    const customerInvoice =
+      await this.customerInvoicesService.createFromSalesOrder(
+        order,
+        linesToInvoice,
+      );
+
+    order.customerInvoiceId = customerInvoice.id;
+    order.customerInvoice = customerInvoice;
+    await this.orderRepo.save(order);
+
+    return this.getSalesOrderDetail(id);
   }
 
   async sendForApproval(id: string): Promise<any> {
